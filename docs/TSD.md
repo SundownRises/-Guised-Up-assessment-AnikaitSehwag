@@ -1,7 +1,7 @@
 # Technical Solution Document — Real Connections Feed
 
 **Project**: Guised Up — Real Connections Feed  
-**Author**: Anika  
+**Author**: Anikait Sehwag
 **Date**: July 2026  
 **Stack**: React Native (Expo) + Laravel 11 + Python FastAPI + PostgreSQL (pgvector)
 
