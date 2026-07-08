@@ -1,0 +1,45 @@
+# Dependency directories
+**/node_modules/
+backend/laravel-api/vendor/
+backend/python-embedding/venv/
+
+# Environment files
+.env
+.env.*
+backend/laravel-api/.env
+backend/laravel-api/.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Laravel specific
+backend/laravel-api/storage/*.key
+backend/laravel-api/storage/framework/cache/data/*
+backend/laravel-api/storage/framework/sessions/*
+backend/laravel-api/storage/framework/testing/*
+backend/laravel-api/storage/framework/views/*
+backend/laravel-api/storage/logs/*
+backend/laravel-api/bootstrap/cache/*
+
+# Python specific
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Expo / React Native specific
+mobile/GuisedUpFeed/.expo/
+mobile/GuisedUpFeed/dist/
+mobile/GuisedUpFeed/web-build/
+
+# IDE / Editor configuration files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
