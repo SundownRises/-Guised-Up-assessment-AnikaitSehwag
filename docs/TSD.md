@@ -1,7 +1,7 @@
 # Technical Solution Document — Real Connections Feed
 
 **Project**: Guised Up — Real Connections Feed  
-**Author**: Anikait Sehwag
+**Author**: Anikait Sehwag  
 **Date**: July 2026  
 **Stack**: React Native (Expo) + Laravel 11 + Python FastAPI + PostgreSQL (pgvector)
 
@@ -9,23 +9,49 @@
 
 ## Table of Contents
 
-1. [System Architecture](#1-system-architecture)
-2. [Database Schema Design](#2-database-schema-design)
-3. [Vector Embedding Strategy](#3-vector-embedding-strategy)
-4. [API Design](#4-api-design)
-5. [Feed Ranking Algorithm](#5-feed-ranking-algorithm)
-6. [AI Agentic Tools Used](#6-ai-agentic-tools-used)
-7. [Trade-offs & Assumptions](#7-trade-offs--assumptions)
+**Part 1 — High-Level Design**
+1. [At a Glance](#1-at-a-glance)
+2. [System Architecture](#2-system-architecture)
+3. [Feed Ranking Philosophy](#3-feed-ranking-philosophy)
+4. [Trade-offs & Assumptions](#4-trade-offs--assumptions)
+5. [AI Tools Used](#5-ai-tools-used)
+
+**Part 2 — Low-Level Implementation**
+6. [Database Schema Design](#6-database-schema-design)
+7. [Vector Embedding Strategy](#7-vector-embedding-strategy)
+8. [API Design](#8-api-design)
+9. [Feed Ranking — Signal Details & Pseudocode](#9-feed-ranking--signal-details--pseudocode)
 
 ---
 
-## 1. System Architecture
+# Part 1 — High-Level Design
 
-### High-Level Overview
+## 1. At a Glance
 
-The system is a three-tier architecture: a React Native mobile client communicates with a Laravel PHP API, which delegates embedding generation to a stateless Python microservice. All data (relational and vector) lives in a single PostgreSQL database with the pgvector extension.
+| Aspect | Decision |
+|--------|----------|
+| Database | PostgreSQL 16 + pgvector 0.7 |
+| Vector dimensions | 384 (all-MiniLM-L6-v2) |
+| Auth | Laravel Sanctum, Bearer tokens |
+| Feed candidates | All posts (no pre-filter) |
+| Ranking weights | relationship=0.35, authenticity=0.25, semantic=0.25, time_decay=0.15 |
+| Time decay | Exponential, λ=0.02, ~7 day effective lifespan |
+| Relationship depth | Directional, materialized, weighted (view=1, reaction=2, reply=3), cap=100 |
+| User interests | 384-dim vector on users table, EMA update (0.9/0.1) |
+| Search | Pure cosine similarity, top 10, threshold ≥ 0.2 |
+| Pagination | Offset-based, 20 per page |
+| Embedding call | Synchronous, graceful NULL fallback |
+| Image authenticity | Placeholder scores, architected for real CV model |
 
-### Architecture Diagram
+---
+
+## 2. System Architecture
+
+### Overview
+
+The system is a three-tier architecture: a React Native mobile client talks to a Laravel API, which delegates embedding generation to a stateless Python microservice. All data — relational and vector — lives in one PostgreSQL database via the pgvector extension.
+
+### Diagram
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -79,37 +105,102 @@ The system is a three-tier architecture: a React Native mobile client communicat
 
 ### Request Flows
 
-**Creating a Post:**
-1. Mobile sends `POST /api/posts` with `{ text, image_url? }` + Bearer token
-2. Laravel validates input via `CreatePostRequest`
-3. `AuthenticityScoreService` computes score from text heuristics + image placeholders
-4. `EmbeddingService` calls Python service `POST http://localhost:8001/embed` with the text
-5. Python returns 384-dimensional vector
-6. Post is stored in PostgreSQL with embedding (via pgvector) and authenticity score
-7. Returns 201 with post data
+**Creating a post**: client sends `{ text, image_url? }` → Laravel validates → `AuthenticityScoreService` computes a score from text heuristics + image placeholders → `EmbeddingService` calls the Python service for a 384-dim embedding → post is stored with embedding and score → `201` returned.
 
-**Fetching the Feed:**
-1. Mobile sends `GET /api/feed?page=1` + Bearer token
-2. `FeedRankingService` fetches all candidate posts (no pre-filtering — all posts are candidates)
-3. For each candidate, computes: `score = 0.25*authenticity + 0.35*relationship_depth + 0.25*semantic_similarity - 0.15*time_decay`
-4. Sorts by score descending, paginates (20 per page)
-5. Returns paginated results with meta
+**Fetching the feed**: client requests a page → `FeedRankingService` scores every candidate post using `score = 0.25*authenticity + 0.35*relationship_depth + 0.25*semantic_similarity − 0.15*time_decay` → sorted descending and paginated (20/page).
 
-**Semantic Search:**
-1. Mobile sends `GET /api/search?q=funny travel stories` + Bearer token
-2. `EmbeddingService` sends query text to Python service, gets 384-dim vector
-3. Laravel queries pgvector using cosine distance operator (`<=>`)
-4. Returns top 10 results where similarity >= 0.2
+**Semantic search**: query text is embedded → compared against post embeddings via pgvector's cosine distance operator (`<=>`) → top 10 results with similarity ≥ 0.2 returned.
 
-**Logging an Interaction:**
-1. Mobile sends `POST /api/interactions` with `{ post_id, type }` + Bearer token
-2. Interaction is stored in `interactions` table
-3. `relationships` table is updated: increment viewer → post_author score by weight (view=1, reaction=2, reply=3)
-4. User's `interest_vector` is updated via exponential moving average (0.9 * old + 0.1 * post_embedding)
+**Logging an interaction**: interaction stored in `interactions` → the `relationships` row for viewer → post author is incremented by interaction weight (view=1, reaction=2, reply=3) → the viewer's `interest_vector` is updated via exponential moving average (`0.9*old + 0.1*post_embedding`).
+
+*(Full request/response contracts are in [Section 8](#8-api-design).)*
 
 ---
 
-## 2. Database Schema Design
+## 3. Feed Ranking Philosophy
+
+The Real Connections Feed inverts traditional social ranking. Instead of optimizing for engagement (likes, shares, time-on-app), it optimizes for **genuine human connection**: is this post authentic, from someone you actually connect with, about something you care about, and reasonably timely?
+
+**Formula:**
+```
+score = (0.25 × authenticity) + (0.35 × relationship_depth) + (0.25 × semantic_similarity) − (0.15 × time_decay)
+```
+All input signals are normalized to [0.0, 1.0] before weighting.
+
+**Why these weights:**
+
+| Signal | Weight | Why |
+|--------|--------|-----|
+| Relationship depth | 0.35 (highest) | The product's name is "Real Connections" — the core promise is surfacing content from people you genuinely connect with |
+| Authenticity | 0.25 | The brand's differentiator, but acts more as a hygiene factor since most genuine posts score similarly |
+| Semantic similarity | 0.25 | Keeps the feed relevant to interests; without it, you'd see all posts from close connections regardless of topic |
+| Time decay | 0.15 (lowest) | "Newer is preferred but not at the expense of relevance" — explicitly the lowest priority per the brief |
+
+*(Full signal-by-signal computation and pseudocode is in [Section 9](#9-feed-ranking--signal-details--pseudocode).)*
+
+---
+
+## 4. Trade-offs & Assumptions
+
+### Trade-offs Made
+
+| Decision | Trade-off | Why We Accepted It |
+|----------|-----------|---------------------|
+| pgvector over Pinecone | Less scalable past ~1M vectors | MVP won't hit this; simpler setup for evaluator; migration path exists |
+| Synchronous embedding | Post creation blocked by Python service | <50ms latency locally; graceful fallback if service is down; avoids queue infra |
+| All posts as candidates | Feed computation scans more posts as volume grows | Fast at <100K posts; avoids cold-start problem for new users |
+| Materialized relationship score | Grows monotonically, no decay | Acceptable for MVP; decay can be added via cron later |
+| Offset pagination | Possible duplicates between pages | Simpler implementation; feed re-ranks on every request anyway |
+| Single heart reaction | Limited expression | Matches brand ethos of simplicity; brief specifies "reaction button" (singular) |
+| Image authenticity placeholders | Doesn't actually detect filters | Properly architected for a future CV model; returns reasonable defaults |
+
+### Assumptions
+
+1. **Scale**: <100K posts, <10K users — informs pgvector, full-candidate scoring, and no caching layer
+2. **Single server**: the Python embedding service runs alongside Laravel on localhost:8001; would sit behind a load balancer in production
+3. **No image uploads**: posts reference images by URL; file upload and CDN are out of scope
+4. **No real-time**: feed is request-driven (pull-to-refresh), not WebSocket-pushed
+5. **Test environment**: assumes PostgreSQL 16+ with pgvector available; Docker instructions provided as fallback
+6. **Embedding model availability**: `all-MiniLM-L6-v2` downloads on first run (~80MB); a deterministic mock activates automatically if the evaluator's network blocks this
+7. **Two seeded users are sufficient** to demonstrate ranking behavior, matching the brief's stated minimum
+
+### What I'd Do Differently With More Time
+
+- **Redis caching** for feed results (30–60s TTL, invalidated on new interactions)
+- **Background embedding backfill** for posts created while the Python service was down
+- **Real image authenticity** via a lightweight CNN or EXIF metadata analysis
+- **Relationship decay** — a daily cron that fades scores for unmaintained connections
+- **A/B testing framework** to experiment with ranking weights
+- **Content moderation** to flag toxic posts before they enter the feed
+- **Cursor-based pagination** for a stable, snapshot-based result set
+
+---
+
+## 5. AI Tools Used
+
+Different tools were used for different phases of this project, matched to what each does best:
+
+**Architecture & Planning — Claude Opus**
+- *Grilling session*: run through the grill-with-docs plugin as a one-on-one interview — a structured back-and-forth that walked through each architectural choice one by one, forcing me to justify every decision and surface trade-offs early rather than discovering them mid-implementation
+- *Domain modeling*: Claude Opus sharpened "authenticity score," "relationship depth," and "semantic similarity" from vague concepts into precise, implementable specs
+- *Trade-off analysis*: Claude Opus helped enumerate alternatives (pgvector vs. Pinecone, sync vs. async embeddings) and reason through the MVP constraints
+
+**Implementation — Claude Sonnet, Claude Code, Kimi, Antigravity, Docker's AI tool**
+- Scaffolding Laravel controllers, services, migrations, and the Python FastAPI service
+- Translating the ranking pseudocode into working PHP, including optimizations like batch-loading relationships instead of N+1 queries
+- Generating PHPUnit feature tests with embedding-service mocks, and scaffolding the React Native feed screen
+- Docker's built-in AI tool assisted with containerizing the Laravel + Python services and debugging the local Compose setup
+
+**Documentation & Everything Else — Gemini, Claude Haiku, ChatGPT**
+- Drafting this TSD and initial SQL queries, later verified against the schema
+
+**Workflow**: think through the decision myself (AI as a sparring partner) → generate boilerplate and initial implementation with AI → review and refine for edge cases and convention compliance → test that the output actually works. I directed the architecture; AI accelerated the execution.
+
+---
+
+# Part 2 — Low-Level Implementation Details
+
+## 6. Database Schema Design
 
 ### Entity Relationship Diagram
 
@@ -203,14 +294,14 @@ The system is a three-tier architecture: a React Native mobile client communicat
 
 ### Design Decisions
 
-- **Single `interactions` table** for all types (view/reply/reaction) rather than separate tables. Simpler schema, one index handles aggregation queries, and the SQL queries in Part D work against a single table.
-- **Materialized `relationships` table** avoids expensive COUNT/SUM on every feed request. Updated incrementally on each interaction.
-- **`interest_vector` on users** rather than a separate table — it's always fetched with the user, one-to-one relationship, avoids an extra JOIN on feed generation.
-- **No soft deletes** — not required by the brief, adds complexity. Hard deletes with foreign key cascades.
+- **Single `interactions` table** for all types (view/reply/reaction) rather than separate tables — simpler schema, one index handles aggregation queries
+- **Materialized `relationships` table** avoids expensive COUNT/SUM on every feed request; updated incrementally on each interaction
+- **`interest_vector` on users** rather than a separate table — always fetched with the user, one-to-one, avoids an extra JOIN on feed generation
+- **No soft deletes** — not required by the brief; hard deletes with foreign key cascades
 
 ---
 
-## 3. Vector Embedding Strategy
+## 7. Vector Embedding Strategy
 
 ### Choice: pgvector (PostgreSQL Extension)
 
@@ -226,13 +317,9 @@ The system is a three-tier architecture: a React Native mobile client communicat
 | Setup complexity | One `CREATE EXTENSION` | API key + SDK + separate infra | Docker + config |
 | Suitable for MVP | Yes | Overkill | Overkill |
 
-**Why pgvector wins for this project:**
-1. We're already using PostgreSQL — no additional infrastructure, deployments, or network configuration
-2. MVP scale is <100K posts — pgvector handles this comfortably with IVFFlat indexing
-3. Queries can JOIN vector similarity with relational data (user relationships, timestamps) in a single SQL query
-4. Simpler for the evaluator to run — `CREATE EXTENSION vector` and done
+**Why pgvector wins here**: already on PostgreSQL, so no added infrastructure; MVP scale (<100K posts) is comfortable with IVFFlat indexing; vector similarity can JOIN with relational data (relationships, timestamps) in a single query; simplest setup for an evaluator (`CREATE EXTENSION vector` and done).
 
-**Migration path**: If Guised Up scales past ~500K posts and search latency degrades, migrate vector data to Qdrant (open-source, self-hostable) while keeping relational data in PostgreSQL.
+**Migration path**: if the product scales past ~500K posts and search latency degrades, migrate vector data to Qdrant (open-source, self-hostable) while keeping relational data in PostgreSQL.
 
 ### Embedding Model: all-MiniLM-L6-v2
 
@@ -241,24 +328,20 @@ The system is a three-tier architecture: a React Native mobile client communicat
 | Model | `sentence-transformers/all-MiniLM-L6-v2` |
 | Output dimensions | 384 |
 | Model size | ~80MB |
-| Inference time | ~10-50ms per sentence (CPU) |
+| Inference time | ~10–50ms per sentence (CPU) |
 | Cost | Free, runs locally |
-| Quality | Strong for semantic similarity tasks; top performer on STSB benchmark for its size class |
+| Quality | Strong for semantic similarity; top performer on STSB benchmark for its size class |
 
-**Why this model:**
-- Free with no API key — evaluator can run it immediately
-- 384 dimensions is compact (lower storage, faster similarity computation vs. 768 or 1536-dim models)
-- Runs on CPU — no GPU required for inference
-- Well-suited for short social media text (trained on sentence pairs)
+**Why this model**: free with no API key, so an evaluator can run it immediately; 384 dimensions is compact (lower storage, faster similarity computation vs. 768/1536-dim models); CPU-only, no GPU required; well-suited to short social text (trained on sentence pairs).
 
-**Fallback**: If the model can't be loaded (low memory, CI environment), the embedding service returns a deterministic mock vector based on a hash of the input text. This ensures the system is always runnable and testable.
+**Fallback**: if the model can't load (low memory, CI environment), the embedding service returns a deterministic mock vector based on a hash of the input text, keeping the system always runnable and testable.
 
 ### How Embeddings Are Used
 
-1. **Post creation**: Text is embedded and stored in `posts.embedding`
-2. **Search**: Query text is embedded, then compared via cosine distance (`<=>` operator) against all post embeddings
-3. **User interest**: On interaction, the post's embedding is blended into `users.interest_vector` using exponential moving average
-4. **Feed ranking**: Cosine similarity between `users.interest_vector` and each candidate `posts.embedding` produces the semantic_similarity signal
+1. **Post creation**: text is embedded and stored in `posts.embedding`
+2. **Search**: query text is embedded, then compared via cosine distance (`<=>`) against all post embeddings
+3. **User interest**: on interaction, the post's embedding is blended into `users.interest_vector` via exponential moving average
+4. **Feed ranking**: cosine similarity between `users.interest_vector` and each candidate `posts.embedding` produces the semantic_similarity signal
 
 ### pgvector Operations
 
@@ -284,11 +367,11 @@ LIMIT 10;
 
 ---
 
-## 4. API Design
+## 8. API Design
 
 ### Authentication
 
-All endpoints require authentication via **Laravel Sanctum** (token-based).
+All endpoints require **Laravel Sanctum** (token-based) authentication.
 
 - Token is obtained via seeder output (for demo) or a login endpoint (future)
 - Sent as: `Authorization: Bearer {token}`
@@ -297,8 +380,7 @@ All endpoints require authentication via **Laravel Sanctum** (token-based).
 
 ### Response Format Convention
 
-All successful responses follow this structure:
-
+Successful responses:
 ```json
 {
   "data": { ... },
@@ -320,9 +402,7 @@ Error responses:
 
 ### Endpoint 1: Create Post
 
-**`POST /api/posts`**
-
-Creates a new post, generates embedding, computes authenticity score.
+**`POST /api/posts`** — creates a post, generates an embedding, computes an authenticity score.
 
 **Request:**
 ```json
@@ -363,11 +443,7 @@ Creates a new post, generates embedding, computes authenticity score.
 
 ### Endpoint 2: Get Feed
 
-**`GET /api/feed?page=1&per_page=20`**
-
-Returns a personalized, ranked feed for the authenticated user.
-
-**Query Parameters:**
+**`GET /api/feed?page=1&per_page=20`** — returns a personalized, ranked feed for the authenticated user.
 
 | Param | Type | Default | Validation |
 |-------|------|---------|------------|
@@ -410,20 +486,13 @@ Returns a personalized, ranked feed for the authenticated user.
 }
 ```
 
-**Notes:**
-- `has_reacted` indicates whether the authenticated user has already reacted to this post
-- Posts are ranked using the feed algorithm (Section 5), not by chronological order
-- All posts in the system are candidates (no social-graph pre-filtering)
+**Notes**: `has_reacted` indicates whether the authenticated user already reacted to this post. Posts are ranked using the feed algorithm ([Section 9](#9-feed-ranking--signal-details--pseudocode)), not chronological order. All posts in the system are candidates — no social-graph pre-filtering.
 
 ---
 
 ### Endpoint 3: Search
 
-**`GET /api/search?q=funny travel stories from last week`**
-
-Semantic search across all posts using vector similarity.
-
-**Query Parameters:**
+**`GET /api/search?q=funny travel stories from last week`** — semantic search across all posts using vector similarity.
 
 | Param | Type | Required | Validation |
 |-------|------|----------|------------|
@@ -454,20 +523,13 @@ Semantic search across all posts using vector similarity.
 }
 ```
 
-**Notes:**
-- Returns maximum 10 results
-- Only returns posts where cosine similarity >= 0.2
-- Searches all posts from all users (discovery tool, not limited to connections)
-- Posts with NULL embedding are excluded from results
-- No pagination — fixed top-10 results
+**Notes**: max 10 results; only posts with cosine similarity ≥ 0.2; searches all users' posts (discovery, not limited to connections); posts with NULL embedding excluded; no pagination, fixed top-10.
 
 ---
 
 ### Endpoint 4: Log Interaction
 
-**`POST /api/interactions`**
-
-Records a user interaction and updates relationship depth.
+**`POST /api/interactions`** — records a user interaction and updates relationship depth.
 
 **Request:**
 ```json
@@ -496,52 +558,34 @@ Records a user interaction and updates relationship depth.
 }
 ```
 
-**Side effects (not in response):**
-- `relationships` row for (user → post_author) is incremented by type weight (view=1, reaction=2, reply=3)
-- User's `interest_vector` is updated: `new = 0.9 * old + 0.1 * post.embedding`
+**Side effects (not in response)**: the `relationships` row for (user → post_author) is incremented by type weight (view=1, reaction=2, reply=3); the user's `interest_vector` is updated as `new = 0.9 * old + 0.1 * post.embedding`.
 
-**Idempotency for reactions:**
-- A user can only have one `reaction` per post. Sending a second `reaction` to the same post removes it (toggle behavior) and returns `200` with `{ "data": { "action": "removed" } }`
-- `view` interactions are not deduplicated (multiple views are valid)
+**Idempotency for reactions**: a user can only have one `reaction` per post — sending a second `reaction` to the same post removes it (toggle behavior) and returns `200` with `{ "data": { "action": "removed" } }`. `view` interactions are not deduplicated.
 
 ---
 
-## 5. Feed Ranking Algorithm
+## 9. Feed Ranking — Signal Details & Pseudocode
 
-### Philosophy
+### Signal 1: Authenticity Score (weight: 0.25)
 
-The Real Connections Feed inverts traditional social media ranking. Instead of optimizing for engagement (likes, shares, time-on-app), it optimizes for **genuine human connection**. The algorithm asks: "Is this post authentic? Is it from someone you actually connect with? Is it about something you care about? Is it timely?"
-
-### The Formula
-
-```
-score = (0.25 × authenticity) + (0.35 × relationship_depth) + (0.25 × semantic_similarity) - (0.15 × time_decay)
-```
-
-All input signals are normalized to [0.0, 1.0] before weighting.
-
-### Signal Breakdown
-
-#### Signal 1: Authenticity Score (weight: 0.25)
-
-Computed once at post creation time. Immutable after that.
+Computed once at post creation time; immutable after that.
 
 **Image signals (45% of authenticity score):**
 
 | Sub-signal | Weight | Logic |
 |------------|--------|-------|
-| Filter detection | 0.25 | Placeholder: returns 1.0 (no image) or 0.8 (has image). Future: CV model detects Instagram-style filters (saturation boost, vignettes, color grading). Lower score = more filters detected. |
-| Retouching detection | 0.20 | Placeholder: returns 1.0 (no image) or 0.8 (has image). Future: detect FaceTune artifacts, skin smoothing, face reshaping. |
+| Filter detection | 0.25 | Placeholder: 1.0 (no image) or 0.8 (has image). Future: CV model detects filters (saturation, vignettes, color grading) — lower score = more filters |
+| Retouching detection | 0.20 | Placeholder: 1.0 (no image) or 0.8 (has image). Future: detect FaceTune artifacts, skin smoothing, reshaping |
 
 **Text signals (55% of authenticity score):**
 
 | Sub-signal | Weight | Logic |
 |------------|--------|-------|
-| Text length | 0.15 | Optimal: 50–500 chars → 1.0. Under 50 → scales linearly from 0.3. Over 500 → gradual decay to 0.5 at 2000+ chars. |
-| Hashtag density | 0.15 | 0 hashtags → 1.0. 1-2 → 0.9. 3-5 → 0.6. >5 → 0.2. |
-| Excessive caps | 0.10 | <10% uppercase → 1.0. 10-30% → linear decay. >30% → 0.3. |
-| URL spam | 0.10 | 0 URLs → 1.0. 1 URL → 0.9. 2 → 0.7. >2 → 0.3. |
-| Has original text | 0.05 | Has text → 1.0. Image-only post (empty text) → 0.4. |
+| Text length | 0.15 | Optimal 50–500 chars → 1.0; under 50 scales linearly from 0.3; over 500 decays gradually to 0.5 at 2000+ chars |
+| Hashtag density | 0.15 | 0 → 1.0. 1–2 → 0.9. 3–5 → 0.6. >5 → 0.2 |
+| Excessive caps | 0.10 | <10% uppercase → 1.0. 10–30% → linear decay. >30% → 0.3 |
+| URL spam | 0.10 | 0 URLs → 1.0. 1 → 0.9. 2 → 0.7. >2 → 0.3 |
+| Has original text | 0.05 | Has text → 1.0. Image-only post (empty text) → 0.4 |
 
 **Pseudocode:**
 ```
@@ -569,52 +613,39 @@ function computeAuthenticityScore(text, imageUrl):
     return clamp(score, 0.0, 1.0)
 ```
 
-#### Signal 2: Relationship Depth (weight: 0.35)
+### Signal 2: Relationship Depth (weight: 0.35)
 
-Measures how genuinely the viewer connects with the post's author. Directional — A's depth toward B is independent of B's depth toward A.
+Measures how genuinely the viewer connects with the post's author. Directional — A's depth toward B is independent of B's depth toward A. Stored in `relationships.score` (materialized, updated on each interaction).
 
-**Stored in**: `relationships.score` (materialized, updated on each interaction)
-
-**Interaction weights:**
 | Type | Weight | Rationale |
 |------|--------|-----------|
 | View | 1 | Passive but shows interest when repeated |
 | Reaction | 2 | Intentional, low effort |
 | Reply | 3 | Active effort, strongest signal of genuine connection |
 
-**Normalization**: Raw score is capped at 100 and divided to produce [0.0, 1.0]:
+**Normalization**: raw score capped at 100, divided to [0.0, 1.0]:
 ```
 normalized_depth = min(raw_score, 100) / 100
 ```
+A user with no interactions toward an author has relationship_depth = 0.0 — they can still see that author's posts, it just gets no relationship boost.
 
-A user with no interactions toward an author has relationship_depth = 0.0. They can still see that author's posts — the 0.0 score just means the post won't get a relationship boost.
+### Signal 3: Semantic Similarity (weight: 0.25)
 
-#### Signal 3: Semantic Similarity (weight: 0.25)
-
-Measures how topically aligned a post is with the viewer's interests.
-
-**Computed as**: Cosine similarity between `users.interest_vector` and `posts.embedding`
-
+Cosine similarity between `users.interest_vector` and `posts.embedding`:
 ```
 semantic_similarity = cosine_sim(user.interest_vector, post.embedding)
 ```
-
-- Range: [-1.0, 1.0] in theory, but almost always [0.0, 1.0] for text embeddings
-- If user has no `interest_vector` (NULL — new user): defaults to 0.5 (neutral)
-- If post has no `embedding` (NULL — service was down): defaults to 0.0
+Range is [-1.0, 1.0] in theory, but almost always [0.0, 1.0] for text embeddings. Defaults to 0.5 (neutral) if the user has no `interest_vector`; defaults to 0.0 if the post has no `embedding`.
 
 **User interest vector update** (on each interaction):
 ```
 user.interest_vector = 0.9 * user.interest_vector + 0.1 * post.embedding
 ```
+This EMA naturally weights recent interests higher without storing interaction history.
 
-This exponential moving average naturally weights recent interests higher without storing interaction history.
+### Signal 4: Time Decay (weight: 0.15)
 
-#### Signal 4: Time Decay (weight: 0.15)
-
-Ensures freshness without dominating relevance. A great post from 3 days ago should still beat a mediocre post from 1 hour ago.
-
-**Function**: Exponential decay
+Ensures freshness without dominating relevance — a great post from 3 days ago should still beat a mediocre post from 1 hour ago.
 
 ```
 time_decay = 1 - e^(-0.02 * age_in_hours)
@@ -673,100 +704,3 @@ function generateFeed(viewer, page, perPage):
     offset = (page - 1) * perPage
     return scoredPosts.slice(offset, offset + perPage)
 ```
-
-### Why These Weights?
-
-| Signal | Weight | Justification |
-|--------|--------|---------------|
-| Relationship depth | 0.35 (highest) | The product's name is "Real Connections" — the core promise is surfacing content from people you genuinely connect with |
-| Authenticity | 0.25 | The brand's differentiator — fewer filters, genuine expression. Important, but acts more as a hygiene factor (most genuine posts score similarly) |
-| Semantic similarity | 0.25 | Keeps the feed relevant to user interests. Without this, you'd see all posts from close connections regardless of topic |
-| Time decay | 0.15 (lowest) | "Newer is preferred but not at the expense of relevance" — this is explicitly the lowest priority per the brief |
-
----
-
-## 6. AI Agentic Tools Used
-
-### Tool: Claude Code (Claude Opus)
-
-**How it was used throughout this project:**
-
-#### Phase 1: Architecture & Planning
-- **Grilling session**: Used Claude Code to conduct a structured decision-making interview, walking through each architectural choice one by one. This forced me to justify every decision and surface trade-offs early rather than discovering them mid-implementation.
-- **Domain modeling**: Sharpened definitions of "authenticity score," "relationship depth," and "semantic similarity" from vague concepts into precise, implementable specifications.
-- **Trade-off analysis**: Claude helped enumerate alternatives (pgvector vs. Pinecone, sync vs. async embeddings) and reason about the MVP constraints.
-
-#### Phase 2: Implementation
-- **Code generation**: Used Claude Code to scaffold Laravel controllers, services, migrations, and the Python FastAPI service. Each generated file was reviewed and customized.
-- **Feed algorithm implementation**: Translated the pseudocode from this TSD into working PHP, with Claude suggesting optimizations (e.g., batch-loading relationships instead of N+1 queries).
-- **Test writing**: Generated PHPUnit feature tests with appropriate mocking of the embedding service.
-- **React Native UI**: Scaffolded the feed screen with proper state management, styled to match the brand direction.
-
-#### Phase 3: Documentation
-- **This TSD**: Written collaboratively with Claude Code. I made the decisions; Claude helped structure them clearly and catch inconsistencies.
-- **SQL queries**: Used Claude for initial drafts, then verified correctness against the schema.
-
-### Why AI Tools Mattered Here
-
-The 8-hour time constraint makes AI tools non-optional. My workflow:
-1. **Think** — Make the architectural decision myself (with AI as a sparring partner)
-2. **Generate** — Let Claude produce the boilerplate and initial implementation
-3. **Review & Refine** — Catch edge cases, adjust naming, ensure convention compliance
-4. **Test** — Verify the output actually works
-
-This is not "copy-paste from ChatGPT." It's agentic collaboration — I directed the architecture; AI accelerated the execution.
-
----
-
-## 7. Trade-offs & Assumptions
-
-### Trade-offs Made
-
-| Decision | Trade-off | Why We Accepted It |
-|----------|-----------|-------------------|
-| pgvector over Pinecone | Less scalable past ~1M vectors | MVP won't hit this. Migration path exists. Simpler setup for evaluator. |
-| Synchronous embedding | Post creation blocked by Python service | Latency is <50ms locally. Graceful fallback if service is down. Avoids queue infrastructure. |
-| All posts as candidates | Feed computation scans more posts | At <100K posts, this is fast. Avoids cold-start problem for new users. |
-| Materialized relationship score | Score grows monotonically (no decay) | Acceptable for MVP. Decay can be added via a cron job later. |
-| Offset pagination | Possible duplicates between pages | Simpler implementation. Feed re-ranks on every request anyway. |
-| Single heart reaction | Limited expression | Matches brand ethos of simplicity. Brief says "reaction button" (singular). |
-| Image authenticity placeholders | Not actually detecting filters | Properly architectured for future CV model. Returns reasonable defaults. Shows we understood the brief. |
-
-### Assumptions
-
-1. **Scale**: <100K posts, <10K users. This informs choices about pgvector, full-candidate scoring, and no caching layer.
-2. **Single server**: The Python embedding service runs on the same machine as Laravel (localhost:8001). In production, it would be behind a load balancer.
-3. **No image uploads**: Posts reference images by URL. Actual file upload and CDN are out of scope.
-4. **No real-time**: Feed is request-driven, not WebSocket-pushed. User pulls to refresh.
-5. **Test environment**: The evaluator has PostgreSQL 16+ with pgvector extension available. Docker instructions provided as a fallback.
-6. **Embedding model availability**: `all-MiniLM-L6-v2` downloads on first run (~80MB). If the evaluator's network blocks this, the deterministic mock fallback activates automatically.
-7. **Two seeded users are sufficient**: The brief requires minimum 2. Our seed data creates meaningful interaction history between them to demonstrate ranking behavior.
-
-### What I'd Do Differently With More Time
-
-1. **Redis caching**: Cache feed results per user with 30-60s TTL. Invalidate on new interactions.
-2. **Background embedding backfill**: Queue job to generate embeddings for posts that were created while the Python service was down.
-3. **Real image authenticity**: Integrate a lightweight CNN (or EXIF metadata analysis) to detect filters and retouching.
-4. **Relationship decay**: Daily cron that multiplies all relationship scores by 0.95 — connections that aren't maintained gradually fade.
-5. **A/B testing framework**: Expose ranking weights as config, run experiments on which balance produces the most "authentic" engagement.
-6. **Content moderation**: Flag posts with toxic content before they enter the feed.
-7. **Cursor-based pagination**: Snapshot the feed at request time and paginate through a stable result set.
-
----
-
-## Appendix: Quick-Reference Summary
-
-| Aspect | Decision |
-|--------|----------|
-| Database | PostgreSQL 16 + pgvector 0.7 |
-| Vector dimensions | 384 (all-MiniLM-L6-v2) |
-| Auth | Laravel Sanctum, Bearer tokens |
-| Feed candidates | All posts (no pre-filter) |
-| Ranking weights | relationship=0.35, authenticity=0.25, semantic=0.25, time_decay=0.15 |
-| Time decay | Exponential, λ=0.02, ~7 day effective lifespan |
-| Relationship depth | Directional, materialized, weighted (view=1, reaction=2, reply=3), cap=100 |
-| User interests | 384-dim vector on users table, EMA update (0.9/0.1) |
-| Search | Pure cosine similarity, top 10, threshold ≥ 0.2 |
-| Pagination | Offset-based, 20 per page |
-| Embedding call | Synchronous, graceful NULL fallback |
-| Image authenticity | Placeholder scores, architected for real CV model |
